@@ -1,12 +1,16 @@
+import asyncio
+import logging
 from enum import Enum
 from math import exp, log, pi, sqrt
-from typing import Optional
-import logging
+from typing import List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from .pic import PICConfig, run_pic_slice_simulation
+from .pic2d import BiasScanSettings, ProbeGeometry, SimulationConfig
+from .sim_manager import simulation_manager
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -91,6 +95,118 @@ class IVCurveResult(BaseModel):
     iv_curve: list[IVPoint]
 
 
+class PICSimulationRequest(BaseModel):
+    patch_width_mm: float = Field(1.0, description="探针截面宽度 (mm)")
+    conductor_thickness_mm: float = Field(0.1, description="导体厚度 (mm)")
+    sheath_thickness_mm: float = Field(0.05, description="鞘层厚度 (mm)")
+    presheath_thickness_mm: float = Field(0.2, description="预鞘层厚度 (mm)")
+    bulk_thickness_mm: float = Field(1.0, description="bulk plasma 厚度 (mm)")
+    ion_density_cm3: float
+    electron_density_cm3: float
+    ion_temperature_ev: float
+    electron_temperature_ev: float
+    plasma_potential_v: float
+    probe_bias_v: float
+    neutral_pressure_pa: float
+    ion_species: IonSpecies
+
+
+class PICSimulationResult(BaseModel):
+    grid_y: list[float]
+    potential_profile: list[float]
+    electric_field_profile: list[float]
+    charge_density_profile: list[float]
+    ion_trajectories: list[dict]
+    electron_trajectories: list[dict]
+    statistics: dict
+    domain_width_m: float
+    domain_height_m: float
+
+
+class ProbeGeometryPayload(BaseModel):
+    shape: Literal["circle", "rectangle"] = "circle"
+    center_x: float = Field(..., description="Probe center x coordinate (m)")
+    center_y: float = Field(..., description="Probe center y coordinate (m)")
+    radius: Optional[float] = Field(None, gt=0, description="Radius for circular probe (m)")
+    width: Optional[float] = Field(None, gt=0, description="Width for rectangular probe (m)")
+    height: Optional[float] = Field(None, gt=0, description="Height for rectangular probe (m)")
+
+
+class PICDomainConfig(BaseModel):
+    lx: float = Field(..., gt=0, description="Domain width in meters")
+    ly: float = Field(..., gt=0, description="Domain height in meters")
+    nx: int = Field(64, ge=16, description="Grid nodes along x")
+    ny: int = Field(64, ge=16, description="Grid nodes along y")
+    dt: Optional[float] = Field(None, gt=0, description="Explicit time step (s)")
+    particles_per_species: int = Field(2000, ge=100, description="Macroparticles per species")
+    snapshot_interval: int = Field(10, ge=1, description="Steps between streamed snapshots")
+    downsample: int = Field(2, ge=1, description="Downsample factor for streamed grids")
+    poisson_iterations: int = Field(60, ge=10, description="Gauss-Seidel iterations per step")
+    relaxation_steps: int = Field(0, ge=0, description="Initial steps at V_probe=0")
+    max_inject_per_step: int = Field(128, ge=1, description="Max macroparticles injected per step")
+    domain_depth: float = Field(1.0, gt=0, description="Effective depth for quasi-2D (m)")
+    rng_seed: Optional[int] = Field(None, description="Optional random seed for reproducibility")
+
+
+class PICPlasmaConfig(BaseModel):
+    density_m3: Optional[float] = Field(None, gt=0, description="Background density (m^-3)")
+    density_cm3: Optional[float] = Field(None, gt=0, description="Background density (cm^-3)")
+    electron_temperature_ev: float = Field(..., gt=0, description="Electron temperature (eV)")
+    ion_temperature_ev: float = Field(..., gt=0, description="Ion temperature (eV)")
+    ion_species: IonSpecies = IonSpecies.AR
+    ion_mass_override: Optional[float] = Field(
+        None, gt=0, description="Optional ion mass override (kg)"
+    )
+    boundary_potential_v: float = Field(0.0, description="Outer boundary potential (V)")
+
+
+class PICBiasScanRequest(BaseModel):
+    bias_values: Optional[List[float]] = Field(
+        None, description="Explicit bias list (V) applied sequentially"
+    )
+    min_voltage: Optional[float] = Field(
+        None, description="Bias sweep minimum (if bias_values not provided)"
+    )
+    max_voltage: Optional[float] = Field(None, description="Bias sweep maximum")
+    voltage_step: Optional[float] = Field(None, description="Bias sweep step")
+    ramp_steps: int = Field(200, ge=1, description="Steps used to ramp toward target bias")
+    settle_steps: int = Field(400, ge=0, description="Steps discarded for settling")
+    measure_steps: int = Field(400, ge=1, description="Measurement steps per bias")
+
+
+class PICJobRequest(BaseModel):
+    plasma: PICPlasmaConfig
+    domain: PICDomainConfig
+    probe: ProbeGeometryPayload
+    bias_scan: PICBiasScanRequest
+
+
+class SimulationJobResponse(BaseModel):
+    job_id: str
+    status: str
+
+
+class SimulationStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    error: Optional[str]
+    completed_bias_points: int
+    total_bias_points: int
+    iv_points: int
+
+
+class IVDataPoint(BaseModel):
+    voltage: float
+    current_total: float
+    current_electrons: float
+    current_ions: float
+
+
+class IVDataResponse(BaseModel):
+    job_id: str
+    iv_data: List[IVDataPoint]
+
+
 app = FastAPI(
     title="Plasma Sheath Simulation Service",
     description="在均匀等离子体中估算平板朗缪尔探针的无碰撞鞘层参数。",
@@ -169,6 +285,103 @@ def _resolve_densities(payload: PlasmaInput, derived_density_cm3: float) -> tupl
 
     density = max(derived_density_cm3, MIN_DENSITY_CM3)
     return density, density
+
+
+def _ensure_probe_geometry(payload: ProbeGeometryPayload) -> ProbeGeometry:
+    if payload.shape == "circle" and payload.radius is None:
+        raise HTTPException(status_code=400, detail="圆形探针需要设置 radius。")
+    if payload.shape == "rectangle" and (payload.width is None or payload.height is None):
+        raise HTTPException(status_code=400, detail="矩形探针需要设置 width 和 height。")
+    return ProbeGeometry(
+        shape=payload.shape,
+        center_x=payload.center_x,
+        center_y=payload.center_y,
+        radius=payload.radius,
+        width=payload.width,
+        height=payload.height,
+    )
+
+
+def _resolve_density_m3(plasma: PICPlasmaConfig) -> float:
+    if plasma.density_m3 is not None:
+        return plasma.density_m3
+    if plasma.density_cm3 is not None:
+        return plasma.density_cm3 * CM3_TO_M3
+    raise HTTPException(status_code=400, detail="需要 density_m3 或 density_cm3。")
+
+
+def _resolve_ion_mass(plasma: PICPlasmaConfig) -> float:
+    if plasma.ion_mass_override is not None:
+        return plasma.ion_mass_override
+    return ION_MASS_MAP[plasma.ion_species]
+
+
+def _build_bias_values(payload: PICBiasScanRequest) -> List[float]:
+    if payload.bias_values:
+        if not payload.bias_values:
+            raise HTTPException(status_code=400, detail="bias_values 不能为空。")
+        return [float(value) for value in payload.bias_values]
+
+    if payload.min_voltage is None or payload.max_voltage is None or payload.voltage_step is None:
+        raise HTTPException(status_code=400, detail="需要 bias_values 或 min/max/step 参数。")
+
+    step = payload.voltage_step
+    if abs(step) < 1e-12:
+        raise HTTPException(status_code=400, detail="voltage_step 不能为 0。")
+
+    start = payload.min_voltage
+    stop = payload.max_voltage
+    direction = 1 if stop >= start else -1
+    step = abs(step) * direction
+
+    values: List[float] = []
+    current = start
+    limit = 2000
+    while (direction > 0 and current <= stop + 1e-9) or (direction < 0 and current >= stop - 1e-9):
+        values.append(round(current, 9))
+        current += step
+        if len(values) > limit:
+            raise HTTPException(status_code=400, detail="扫描点数过多 (>2000)。")
+    return values
+
+
+def _build_simulation_config(request: PICJobRequest) -> SimulationConfig:
+    geometry = _ensure_probe_geometry(request.probe)
+    density = _resolve_density_m3(request.plasma)
+    ion_mass = _resolve_ion_mass(request.plasma)
+    domain = request.domain
+    plasma = request.plasma
+    return SimulationConfig(
+        lx=domain.lx,
+        ly=domain.ly,
+        nx=domain.nx,
+        ny=domain.ny,
+        density_m3=density,
+        electron_temperature_ev=plasma.electron_temperature_ev,
+        ion_temperature_ev=plasma.ion_temperature_ev,
+        ion_mass=ion_mass,
+        particles_per_species=domain.particles_per_species,
+        probe=geometry,
+        dt=domain.dt,
+        boundary_potential=plasma.boundary_potential_v,
+        snapshot_interval=domain.snapshot_interval,
+        downsample=domain.downsample,
+        poisson_iterations=domain.poisson_iterations,
+        relaxation_steps=domain.relaxation_steps,
+        max_inject_per_step=domain.max_inject_per_step,
+        domain_depth=domain.domain_depth,
+        rng_seed=domain.rng_seed,
+    )
+
+
+def _build_bias_scan(request: PICBiasScanRequest) -> BiasScanSettings:
+    bias_values = _build_bias_values(request)
+    return BiasScanSettings(
+        bias_values=bias_values,
+        ramp_steps=request.ramp_steps,
+        settle_steps=request.settle_steps,
+        measure_steps=request.measure_steps,
+    )
 
 
 def run_sheath_model(payload: PlasmaInput) -> SheathResult:
@@ -362,3 +575,106 @@ def calculate_iv_curve(request: IVCurveRequest):
         logger.error(f"❌ I-V 曲线计算错误: {type(e).__name__}: {str(e)}")
         logger.exception("详细错误信息:")
         raise HTTPException(status_code=500, detail=f"I-V 曲线计算错误: {str(e)}")
+
+
+@app.post("/pic-slice", response_model=PICSimulationResult)
+def run_pic_slice(payload: PICSimulationRequest):
+    """运行二维无碰撞 PIC 片段仿真。"""
+    try:
+        ion_density_m3 = max(payload.ion_density_cm3, MIN_DENSITY_CM3) * CM3_TO_M3
+        electron_density_m3 = max(payload.electron_density_cm3, MIN_DENSITY_CM3) * CM3_TO_M3
+        result = run_pic_slice_simulation(
+            patch_width_m=payload.patch_width_mm * 1e-3,
+            conductor_thickness_m=payload.conductor_thickness_mm * 1e-3,
+            sheath_thickness_m=payload.sheath_thickness_mm * 1e-3,
+            presheath_thickness_m=payload.presheath_thickness_mm * 1e-3,
+            bulk_thickness_m=payload.bulk_thickness_mm * 1e-3,
+            ion_density_m3=ion_density_m3,
+            electron_density_m3=electron_density_m3,
+            ion_temperature_ev=payload.ion_temperature_ev,
+            electron_temperature_ev=payload.electron_temperature_ev,
+            plasma_potential_v=payload.plasma_potential_v,
+            probe_bias_v=payload.probe_bias_v,
+            neutral_pressure_pa=payload.neutral_pressure_pa,
+            ion_species=payload.ion_species.value,
+            config=PICConfig(),
+        )
+        return result
+    except Exception as exc:
+        logger.exception("PIC 仿真错误")
+        raise HTTPException(status_code=500, detail=f"PIC 仿真错误: {exc}")
+
+
+@app.post("/pic/jobs", response_model=SimulationJobResponse)
+async def create_pic_job(payload: PICJobRequest):
+    """启动完整 2D PIC 仿真并返回 job_id。"""
+    config = _build_simulation_config(payload)
+    bias_scan = _build_bias_scan(payload.bias_scan)
+    job = simulation_manager.create_job(config, bias_scan)
+    loop = asyncio.get_running_loop()
+    job.start(loop)
+    return SimulationJobResponse(job_id=job.job_id, status=job.status)
+
+
+@app.get("/pic/jobs", response_model=list[SimulationStatusResponse])
+def list_pic_jobs():
+    jobs = simulation_manager.list_jobs()
+    return [
+        SimulationStatusResponse(
+            job_id=item["job_id"],
+            status=item["status"],
+            error=item["error"],
+            completed_bias_points=item["completed_bias_points"],
+            total_bias_points=item["total_bias_points"],
+            iv_points=item["iv_points"],
+        )
+        for item in jobs
+    ]
+
+
+@app.get("/pic/jobs/{job_id}", response_model=SimulationStatusResponse)
+def get_pic_job(job_id: str):
+    job = simulation_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="未找到 PIC 仿真任务。")
+    return SimulationStatusResponse(
+        job_id=job.job_id,
+        status=job.status,
+        error=job.error,
+        completed_bias_points=job.completed_bias_points,
+        total_bias_points=job.total_bias_points,
+        iv_points=len(job.iv_data),
+    )
+
+
+@app.get("/pic/jobs/{job_id}/iv", response_model=IVDataResponse)
+def get_pic_iv_data(job_id: str):
+    job = simulation_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="未找到 PIC 仿真任务。")
+    return IVDataResponse(
+        job_id=job.job_id,
+        iv_data=[
+            IVDataPoint(**point)
+            for point in job.iv_data
+        ],
+    )
+
+
+@app.websocket("/ws/pic/{job_id}")
+async def stream_pic_updates(websocket: WebSocket, job_id: str):
+    await websocket.accept()
+    job = simulation_manager.get_job(job_id)
+    if not job:
+        await websocket.send_json({"type": "error", "message": "未找到仿真任务。"})
+        await websocket.close(code=4404)
+        return
+    queue = await job.subscribe()
+    try:
+        while True:
+            payload = await queue.get()
+            await websocket.send_json(payload)
+    except WebSocketDisconnect:
+        logger.info("WebSocket 断开：%s", job_id)
+    finally:
+        job.unsubscribe(queue)

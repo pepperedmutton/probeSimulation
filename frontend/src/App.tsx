@@ -1,12 +1,26 @@
-import { useMemo, useState } from "react";
-import type { ChangeEvent, FormEvent } from "react";
-import type { IonSpecies, PlasmaInput, SheathResult, IVPoint } from "./lib/api";
-import { calculateIVCurve } from "./lib/api";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { ChangeEvent } from "react";
+import type {
+  IonSpecies,
+  PlasmaInput,
+  PICIvPoint,
+  PicSnapshotMessage,
+  PicStreamMessage,
+} from "./lib/api";
+import { API_BASE, createPicJob, fetchPicIvData } from "./lib/api";
 import "./App.css";
 
 const CM3_TO_M3 = 1e6;
 const BOLTZMANN = 1.380649e-23;
 const GAS_TEMPERATURE_K = 300;
+const EPSILON_0 = 8.8541878128e-12;
+const ELEMENTARY_CHARGE = 1.602176634e-19;
+const ELECTRON_MASS = 9.10938356e-31;
+const AMU = 1.6605390666e-27;
+const ION_MASS_MAP: Record<IonSpecies, number> = {
+  Ar: 39.948 * AMU,
+  Xe: 131.293 * AMU,
+};
 
 const DEFAULT_FORM: PlasmaInput = {
   neutral_gas_pressure_pa: 0.01,  // 降低到0.01 Pa，更接近低压等离子体实验条件
@@ -31,10 +45,17 @@ type ScanSettings = {
 function App() {
   const [formValues, setFormValues] = useState<PlasmaInput>(DEFAULT_FORM);
   const [densityMode, setDensityMode] = useState<DensityMode>("derived");
-  const [result, setResult] = useState<SheathResult | null>(null);
-  const [ivCurveData, setIvCurveData] = useState<IVPoint[] | null>(null);
+  const [picJobId, setPicJobId] = useState<string | null>(null);
+  const [picJobStatus, setPicJobStatus] = useState<string>("idle");
+  const [picSnapshot, setPicSnapshot] = useState<PicSnapshotMessage | null>(null);
+  const [picIvData, setPicIvData] = useState<PICIvPoint[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [picLoading, setPicLoading] = useState(false);
+  const [picError, setPicError] = useState<string | null>(null);
+  const [picProgress, setPicProgress] = useState({ completed: 0, total: 0 });
+  const [picStreamConnected, setPicStreamConnected] = useState(false);
+  const websocketRef = useRef<WebSocket | null>(null);
   const [scanSettings, setScanSettings] = useState<ScanSettings>({
     minVoltage: -30,
     maxVoltage: 30,
@@ -51,6 +72,181 @@ function App() {
     () => neutralDensityCm3 * Math.max(formValues.ionization_fraction, 1e-4),
     [neutralDensityCm3, formValues.ionization_fraction],
   );
+
+  const activeDensityCm3 = useMemo(() => {
+    if (densityMode === "electron") {
+      return Math.max(formValues.electron_density_cm3 ?? derivedDensity, 1e4);
+    }
+    if (densityMode === "ion") {
+      return Math.max(formValues.ion_density_cm3 ?? derivedDensity, 1e4);
+    }
+    return derivedDensity;
+  }, [densityMode, formValues.electron_density_cm3, formValues.ion_density_cm3, derivedDensity]);
+
+  const debyeLength = useMemo(() => {
+    const electronDensityM3 = activeDensityCm3 * CM3_TO_M3;
+    const teJoule = Math.max(formValues.electron_energy_ev, 1e-3) * ELEMENTARY_CHARGE;
+    const denominator = Math.max(electronDensityM3 * ELEMENTARY_CHARGE ** 2, 1e-20);
+    return Math.sqrt((EPSILON_0 * teJoule) / denominator);
+  }, [activeDensityCm3, formValues.electron_energy_ev]);
+
+  const ionMass = ION_MASS_MAP[formValues.ion_species];
+  const activeDensityM3 = activeDensityCm3 * CM3_TO_M3;
+
+  const electronPlasmaFrequency = useMemo(() => {
+    return Math.sqrt(
+      Math.max(activeDensityM3, 1e6) * ELEMENTARY_CHARGE ** 2 / (EPSILON_0 * ELECTRON_MASS),
+    );
+  }, [activeDensityM3]);
+
+  const ionPlasmaFrequency = useMemo(() => {
+    return Math.sqrt(
+      Math.max(activeDensityM3, 1e6) * ELEMENTARY_CHARGE ** 2 / (EPSILON_0 * ionMass),
+    );
+  }, [activeDensityM3, ionMass]);
+
+  const bohmVelocity = useMemo(() => {
+    const teJoule = Math.max(formValues.electron_energy_ev, 1e-3) * ELEMENTARY_CHARGE;
+    return Math.sqrt(teJoule / ionMass);
+  }, [formValues.electron_energy_ev, ionMass]);
+
+  const domainWidthMeters = Math.max(debyeLength * 20, 1e-4);
+  const domainHeightMeters = Math.max(debyeLength * 10, 1e-4);
+
+  const picFieldStats = useMemo(() => {
+    if (!picSnapshot) return null;
+    const maxValue = (grid: number[][]) => {
+      let maximum = -Infinity;
+      for (const row of grid) {
+        for (const value of row) {
+          if (value > maximum) {
+            maximum = value;
+          }
+        }
+      }
+      return maximum === -Infinity ? 0 : maximum;
+    };
+    const minValue = (grid: number[][]) => {
+      let minimum = Infinity;
+      for (const row of grid) {
+        for (const value of row) {
+          if (value < minimum) {
+            minimum = value;
+          }
+        }
+      }
+      return minimum === Infinity ? 0 : minimum;
+    };
+    return {
+      ePeak: maxValue(picSnapshot.fields.e_magnitude),
+      phiMin: minValue(picSnapshot.fields.phi),
+      phiMax: maxValue(picSnapshot.fields.phi),
+      rhoMin: minValue(picSnapshot.fields.rho),
+      rhoMax: maxValue(picSnapshot.fields.rho),
+    };
+  }, [picSnapshot]);
+
+  useEffect(() => {
+    return () => {
+      if (websocketRef.current) {
+        websocketRef.current.close();
+        websocketRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!picJobId) {
+      return;
+    }
+    const normalizedBase = API_BASE.replace(/\/$/, "");
+    const protocol = normalizedBase.startsWith("https") ? "wss" : "ws";
+    const host = normalizedBase.replace(/^https?:\/\//, "");
+    const wsUrl = `${protocol}://${host}/ws/pic/${picJobId}`;
+
+    const ws = new WebSocket(wsUrl);
+    websocketRef.current = ws;
+    setPicStreamConnected(false);
+
+    ws.onopen = () => {
+      setPicStreamConnected(true);
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const payload: PicStreamMessage = JSON.parse(event.data);
+        if (payload.type === "snapshot") {
+          setPicSnapshot(payload);
+        } else if (payload.type === "status") {
+          setPicJobStatus(payload.status);
+          setPicProgress({
+            completed: payload.completed_bias_points ?? 0,
+            total: payload.total_bias_points ?? 0,
+          });
+          if (payload.error) {
+            setPicError(payload.error);
+          }
+        } else if (payload.type === "iv_point") {
+          setPicIvData((prev) => {
+            const map = new Map(prev.map((point) => [point.voltage, point]));
+            map.set(payload.data.voltage, payload.data);
+            return Array.from(map.values()).sort((a, b) => a.voltage - b.voltage);
+          });
+        } else if (payload.type === "error") {
+          setPicError(payload.message);
+          setPicJobStatus("failed");
+        }
+      } catch (err) {
+        console.error("无法解析 PIC 流消息", err);
+      }
+    };
+
+    ws.onerror = () => {
+      setPicStreamConnected(false);
+      setPicError("PIC 数据流连接出现问题");
+    };
+
+    ws.onclose = () => {
+      setPicStreamConnected(false);
+      if (websocketRef.current === ws) {
+        websocketRef.current = null;
+      }
+    };
+
+    return () => {
+      ws.close();
+    };
+  }, [picJobId]);
+
+  useEffect(() => {
+    if (!picJobId || picJobStatus !== "completed") {
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const response = await fetchPicIvData(picJobId);
+        if (!cancelled) {
+          setPicIvData(response.iv_data);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setPicError(err instanceof Error ? err.message : "获取 PIC I-V 数据失败");
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [picJobId, picJobStatus]);
+
+  useEffect(() => {
+    if (picJobStatus === "pending" || picJobStatus === "running") {
+      setPicLoading(true);
+    } else if (picJobStatus === "completed" || picJobStatus === "failed") {
+      setPicLoading(false);
+    }
+  }, [picJobStatus]);
 
   const handleNumberChange = (event: ChangeEvent<HTMLInputElement>) => {
     const { name, value } = event.target;
@@ -94,46 +290,117 @@ function App() {
     }));
   };
 
-  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    setError(null);
-    setLoading(true);
-
-    const payload: PlasmaInput = {
-      ...formValues,
-      ion_density_cm3:
-        densityMode === "ion" ? formValues.ion_density_cm3 ?? derivedDensity : null,
-      electron_density_cm3:
-        densityMode === "electron" ? formValues.electron_density_cm3 ?? derivedDensity : null,
-    };
-
-    try {
-      // 调用后端计算 I-V 曲线（包含鞘层参数）
-      const ivResult = await calculateIVCurve({
-        plasma_params: payload,
-        min_voltage: scanSettings.minVoltage,
-        max_voltage: scanSettings.maxVoltage,
-        steps: scanSettings.steps,
-      });
-      
-      setResult(ivResult.sheath_params);
-      setIvCurveData(ivResult.iv_curve);
-      
-      console.log(`从后端获取 ${ivResult.iv_curve.length} 个 I-V 数据点`);
-      const currents = ivResult.iv_curve.map(p => p.current);
-      console.log(`电流范围: ${Math.min(...currents).toExponential(2)} ~ ${Math.max(...currents).toExponential(2)} A`);
-    } catch (err) {
-      setResult(null);
-      setIvCurveData(null);
-      setError(err instanceof Error ? err.message : "Unexpected error");
-    } finally {
-      setLoading(false);
-    }
-  };
-
   const handleReset = () => {
     setFormValues(DEFAULT_FORM);
     setDensityMode("derived");
+  };
+
+  const handleRunPic = async () => {
+    setError(null);
+    setPicError(null);
+    setLoading(true);
+
+    const start = scanSettings.minVoltage;
+    const end = scanSettings.maxVoltage;
+    const rawSteps = Math.max(scanSettings.steps, 1);
+    const biases: number[] = [];
+    const span = end - start;
+    if (rawSteps === 1 || Math.abs(span) < 1e-6) {
+      biases.push(Number(start.toFixed(2)));
+    } else {
+      const direction = span >= 0 ? 1 : -1;
+      const absoluteStep = Math.abs(span) / (rawSteps - 1);
+      for (let i = 0; i < rawSteps; i += 1) {
+        const value = start + direction * absoluteStep * i;
+        biases.push(Number(value.toFixed(2)));
+      }
+    }
+    if (!biases.length) {
+      setPicError("无法生成有效的偏压序列。");
+      setLoading(false);
+      return;
+    }
+
+    const safeDebye = Math.max(debyeLength, 1e-5);
+    const cellsPerDebye = 6;
+    const estimateNx = Math.max(48, Math.round((domainWidthMeters / safeDebye) * cellsPerDebye));
+    const estimateNy = Math.max(48, Math.round((domainHeightMeters / safeDebye) * cellsPerDebye));
+    const nx = Math.min(200, estimateNx);
+    const ny = Math.min(200, estimateNy);
+    const particlesPerSpecies = Math.min(8000, Math.max(2000, Math.round((nx * ny) / 2)));
+
+    const probeRadius = Math.max(Math.min(domainWidthMeters, domainHeightMeters) * 0.06, 5e-5);
+    const probeGeometry = {
+      shape: "circle" as const,
+      center_x: domainWidthMeters / 2,
+      center_y: Math.min(domainHeightMeters * 0.25, probeRadius * 2.5),
+      radius: probeRadius,
+    };
+
+    const durationScale = Math.max(scanSettings.duration_ms, 80);
+    const rampSteps = Math.max(60, Math.round(durationScale * 0.25));
+    const measureSteps = Math.max(200, Math.round(durationScale));
+
+    const densityCm3 = activeDensityCm3;
+    const payloadDensity = Math.max(densityCm3, 1e4);
+
+    const payload = {
+      plasma: {
+        density_cm3: payloadDensity,
+        electron_temperature_ev: formValues.electron_energy_ev,
+        ion_temperature_ev: formValues.ion_energy_ev,
+        ion_species: formValues.ion_species,
+        boundary_potential_v: formValues.plasma_potential_v,
+      },
+      domain: {
+        lx: domainWidthMeters,
+        ly: domainHeightMeters,
+        nx,
+        ny,
+        dt: null,
+        particles_per_species: Math.round(particlesPerSpecies),
+        snapshot_interval: 10,
+        downsample: 2,
+        poisson_iterations: 80,
+        relaxation_steps: 50,
+        max_inject_per_step: 128,
+        domain_depth: Math.max(domainWidthMeters * 0.2, 1e-3),
+        rng_seed: undefined,
+      },
+      probe: probeGeometry,
+      bias_scan: {
+        bias_values: biases,
+        ramp_steps: rampSteps,
+        settle_steps: 0,
+        measure_steps: measureSteps,
+      },
+    };
+
+    setPicError(null);
+    setPicSnapshot(null);
+    setPicIvData([]);
+    setPicProgress({ completed: 0, total: biases.length });
+    setPicJobStatus("pending");
+    setPicStreamConnected(false);
+    if (websocketRef.current) {
+      websocketRef.current.close();
+      websocketRef.current = null;
+    }
+    setPicJobId(null);
+
+    try {
+      const response = await createPicJob(payload);
+      setPicJobId(response.job_id);
+      setPicJobStatus(response.status ?? "pending");
+    } catch (err) {
+      setPicError(err instanceof Error ? err.message : "PIC 仿真启动失败");
+      setPicJobStatus("failed");
+      setPicLoading(false);
+      setLoading(false);
+      return;
+    }
+
+    setLoading(false);
   };
 
   return (
@@ -151,7 +418,7 @@ function App() {
               设置 bulk plasma 的中性气体密度与电离率，鞘层区域以无碰撞近似求解。
             </p>
           </div>
-          <form onSubmit={handleSubmit} className="probe-form">
+          <div className="probe-form">
             <div className="field-grid">
               <label>
                 中性气体压强 (Pa)
@@ -306,12 +573,24 @@ function App() {
                   重置
                 </button>
               </div>
-              <button type="submit" disabled={loading}>
-                {loading ? "计算中..." : "求解鞘层"}
-              </button>
             </div>
-          </form>
+          </div>
           {error && <p className="error">{error}</p>}
+        </section>
+
+        <section className="panel animation-panel">
+          <div className="panel-heading">
+            <h2>PIC 粒子运动预览</h2>
+            <p className="panel-subtitle">
+              在探针导体上方沿垂直方向展示离子/电子的代表性运动，用以直观理解鞘层、预鞘层与 bulk plasma。
+            </p>
+          </div>
+          <ParticleAnimation
+            snapshot={picSnapshot}
+            fallbackWidthM={domainWidthMeters}
+            fallbackHeightM={domainHeightMeters}
+            ionSpecies={formValues.ion_species}
+          />
         </section>
 
         <section className="probe-console">
@@ -320,23 +599,20 @@ function App() {
             <div className="iv-panel">
               <div className="panel-heading">
                 <h3>I-V Curve</h3>
-                <p className="panel-subtitle">根据当前等离子体参数快速合成的 I-V 扫描曲线。</p>
+                <p className="panel-subtitle">由实时 PIC 仿真返回的平均电流点，将在计算完成后逐点落在曲线上。</p>
               </div>
-              <IVCurve ivData={ivCurveData} />
+              <IVCurve ivData={picIvData} />
             </div>
             <div className="console-side">
               <div className="console-panel">
-                <h3>解算物理量</h3>
-                {result ? (
-                  <ul>
-                    <li>浮动电位：{result.floating_potential_v.toFixed(2)} V</li>
-                    <li>探针温度：{result.probe_temperature_k.toFixed(1)} K</li>
-                    <li>离子饱和电流：{(result.ion_saturation_current_a * 1e3).toFixed(2)} mA</li>
-                    <li>德拜长度：{(result.electron_debye_length_m * 1e3).toFixed(3)} mm</li>
-                  </ul>
-                ) : (
-                  <p>求解完成后，这里展示探针关键指标。</p>
-                )}
+                <h3>输入推导指标</h3>
+                <ul>
+                  <li>有效密度：{activeDensityCm3.toExponential(2)} cm⁻³</li>
+                  <li>德拜长度：{(debyeLength * 1e3).toFixed(3)} mm</li>
+                  <li>电子等离子体频率：{(electronPlasmaFrequency / 1e9).toFixed(2)} GHz</li>
+                  <li>离子等离子体频率：{(ionPlasmaFrequency / 1e6).toFixed(2)} MHz</li>
+                  <li>玻姆速度：{bohmVelocity.toFixed(0)} m/s</li>
+                </ul>
               </div>
               <div className="console-panel">
                 <h3>扫描设置</h3>
@@ -388,6 +664,73 @@ function App() {
             </div>
           </div>
         </section>
+
+        <section className="panel pic-panel">
+          <div className="panel-heading">
+            <h2>二维 PIC 仿真</h2>
+            <p className="panel-subtitle">
+              无碰撞 PIC 核心实时求解探针偏压扫描，唯一的电流来源即来自该仿真结果。
+            </p>
+          </div>
+          <div className="pic-controls">
+            <button type="button" onClick={handleRunPic} disabled={loading || picLoading}>
+              {loading
+                ? "准备仿真参数..."
+                : picLoading
+                  ? "PIC 仿真运行中..."
+                  : "启动二维 PIC 扫描"}
+            </button>
+            <span className={`stream-status ${picStreamConnected ? "stream-ok" : "stream-idle"}`}>
+              数据流：{picStreamConnected ? "实时更新中" : "等待连接"}
+            </span>
+          </div>
+          {picError && <p className="error">{picError}</p>}
+          <div className="pic-status">
+            <p>任务 ID：{picJobId ?? "尚未启动"}</p>
+            <p>
+              状态：{picJobStatus === "idle" ? "待机" : picJobStatus === "pending" ? "排队" : picJobStatus === "running" ? "运行中" : picJobStatus === "completed" ? "已完成" : "失败"}
+            </p>
+            <p>
+              进度：{picProgress.completed}/{picProgress.total || Math.max(scanSettings.steps, 1)}
+            </p>
+            {picSnapshot ? (
+              <>
+                <p>
+                  当前偏压：{picSnapshot.bias_value.toFixed(2)} V（阶段：{picSnapshot.phase}）
+                </p>
+                <p>
+                  瞬时电流：{(picSnapshot.currents.total * 1e3).toFixed(2)} mA（电子{" "}
+                  {(picSnapshot.currents.electrons * 1e3).toFixed(2)} mA，离子{" "}
+                  {(picSnapshot.currents.ions * 1e3).toFixed(2)} mA）
+                </p>
+              </>
+            ) : (
+              <p>尚未收到实时帧。</p>
+            )}
+          </div>
+          {picSnapshot && picFieldStats ? (
+            <div className="pic-field-stats">
+              <div>
+                <h4>电场峰值</h4>
+                <p>{picFieldStats.ePeak.toExponential(2)} V/m</p>
+              </div>
+              <div>
+                <h4>势场范围</h4>
+                <p>
+                  {picFieldStats.phiMin.toFixed(2)} V ~ {picFieldStats.phiMax.toFixed(2)} V
+                </p>
+              </div>
+              <div>
+                <h4>电荷密度范围</h4>
+                <p>
+                  {picFieldStats.rhoMin.toExponential(2)} ~ {picFieldStats.rhoMax.toExponential(2)} C/m³
+                </p>
+              </div>
+            </div>
+          ) : (
+            <p className="placeholder">启动任务后，这里会展示实时帧分析结果。</p>
+          )}
+        </section>
       </main>
     </div>
   );
@@ -396,7 +739,7 @@ function App() {
 export default App;
 
 type IVCurveProps = {
-  ivData: IVPoint[] | null;
+  ivData: PICIvPoint[];
 };
 
 function IVCurve({ ivData }: IVCurveProps) {
@@ -408,9 +751,9 @@ function IVCurve({ ivData }: IVCurveProps) {
     const width = 700;
     const height = 280;
     const pad = 50;
-    
+
     const voltages = ivData.map((p) => p.voltage);
-    const currents = ivData.map((p) => p.current);
+    const currents = ivData.map((p) => p.current_total);
     const minV = Math.min(...voltages);
     const maxV = Math.max(...voltages);
     const minI = Math.min(...currents, -1e-3);
@@ -423,7 +766,7 @@ function IVCurve({ ivData }: IVCurveProps) {
     const path = ordered
       .map((point, index) => {
         const x = pad + ((point.voltage - minV) / spanV) * (width - 2 * pad);
-        const y = height - pad - ((point.current - minI) / spanI) * (height - 2 * pad);
+        const y = height - pad - ((point.current_total - minI) / spanI) * (height - 2 * pad);
         return `${index === 0 ? "M" : "L"}${x.toFixed(2)},${y.toFixed(2)}`;
       })
       .join(" ");
@@ -507,6 +850,166 @@ function IVCurve({ ivData }: IVCurveProps) {
           I 范围：{(shape.minI * 1e3).toFixed(2)} ~ {(shape.maxI * 1e3).toFixed(2)} mA
         </span>
       </div>
+    </div>
+  );
+}
+
+type ParticleAnimationProps = {
+  snapshot: PicSnapshotMessage | null;
+  fallbackWidthM: number;
+  fallbackHeightM: number;
+  ionSpecies: IonSpecies;
+};
+
+function ParticleAnimation({
+  snapshot,
+  fallbackWidthM,
+  fallbackHeightM,
+  ionSpecies,
+}: ParticleAnimationProps) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const potentialStats = useMemo(() => {
+    if (!snapshot) return null;
+    const phiGrid = snapshot.fields.phi;
+    if (!phiGrid.length) return { min: 0, max: 0, maxAbs: 1 };
+    let min = Infinity;
+    let max = -Infinity;
+    for (const column of phiGrid) {
+      for (const value of column) {
+        if (value < min) min = value;
+        if (value > max) max = value;
+      }
+    }
+    const maxAbs = Math.max(Math.abs(min), Math.abs(max), 1e-6);
+    return { min, max, maxAbs };
+  }, [snapshot]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return;
+    }
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (!snapshot) {
+      return;
+    }
+
+    const gridX = snapshot.grid.x;
+    const gridY = snapshot.grid.y;
+    const domainWidth = gridX.length > 0 ? gridX[gridX.length - 1] : fallbackWidthM;
+    const domainHeight = gridY.length > 0 ? gridY[gridY.length - 1] : fallbackHeightM;
+    const width = canvas.width;
+    const height = canvas.height;
+    const range = potentialStats ?? { min: 0, max: 0, maxAbs: 1 };
+
+    const phiGrid = snapshot.fields.phi;
+    const phiNx = phiGrid.length;
+    const phiNy = phiNx > 0 ? phiGrid[0].length : 0;
+
+    const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+    const colorForPotential = (value: number) => {
+      const normalized = Math.max(0, Math.min(1, (value + range.maxAbs) / (2 * range.maxAbs)));
+      const mid = 0.5;
+      let r: number;
+      let g: number;
+      let b: number;
+      if (normalized < mid) {
+        const t = normalized / mid;
+        r = lerp(59, 245, t);
+        g = lerp(130, 245, t);
+        b = lerp(246, 245, t);
+      } else {
+        const t = (normalized - mid) / (1 - mid);
+        r = lerp(245, 239, t);
+        g = lerp(245, 68, t);
+        b = lerp(245, 68, t);
+      }
+      return `rgb(${r.toFixed(0)}, ${g.toFixed(0)}, ${b.toFixed(0)})`;
+    };
+
+    if (phiNx && phiNy) {
+      const cellWidth = width / phiNx;
+      const cellHeight = height / phiNy;
+      for (let ix = 0; ix < phiNx; ix += 1) {
+        for (let iy = 0; iy < phiNy; iy += 1) {
+          const value = phiGrid[ix][iy];
+          ctx.fillStyle = colorForPotential(value);
+          const xPx = ix * cellWidth;
+          const yPx = height - (iy + 1) * cellHeight;
+          ctx.fillRect(xPx, yPx, cellWidth + 1, cellHeight + 1);
+        }
+      }
+    }
+
+    const drawParticles = (points: number[][], color: string, radius: number) => {
+      ctx.fillStyle = color;
+      points.forEach((point) => {
+        if (point.length < 2) return;
+        const [xVal, yVal] = point;
+        const xPx = (xVal / domainWidth) * width;
+        const yPx = height - (yVal / domainHeight) * height;
+        ctx.beginPath();
+        ctx.arc(xPx, yPx, radius, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    };
+
+    drawParticles(snapshot.particles.ions, "rgba(255, 149, 0, 0.85)", 2.2);
+    drawParticles(snapshot.particles.electrons, "rgba(64, 182, 255, 0.9)", 1.6);
+  }, [snapshot, fallbackWidthM, fallbackHeightM, potentialStats]);
+
+  const domainWidthMm =
+    snapshot && snapshot.grid.x.length > 0
+      ? snapshot.grid.x[snapshot.grid.x.length - 1] * 1000
+      : fallbackWidthM * 1000;
+  const domainHeightMm =
+    snapshot && snapshot.grid.y.length > 0
+      ? snapshot.grid.y[snapshot.grid.y.length - 1] * 1000
+      : fallbackHeightM * 1000;
+
+  return (
+    <div className="particle-animation">
+      <p className="domain-info">
+        仿真域尺寸：{domainWidthMm.toFixed(2)} mm × {domainHeightMm.toFixed(2)} mm
+      </p>
+      <div className="animation-canvas-wrapper">
+        {snapshot ? (
+          <canvas ref={canvasRef} width={720} height={720} />
+        ) : (
+          <div className="animation-placeholder">启动二维 PIC 任务后可实时观看粒子演化</div>
+        )}
+        <div className="probe-surface-strip">
+          <span>探针导体</span>
+        </div>
+      </div>
+      {snapshot && potentialStats && (
+        <div className="potential-legend">
+          <div className="colorbar">
+            <span>电势分布 (V)</span>
+            <div className="colorbar-gradient" />
+            <div className="colorbar-values">
+              <span>{potentialStats.min.toFixed(2)}</span>
+              <span>0</span>
+              <span>{potentialStats.max.toFixed(2)}</span>
+            </div>
+          </div>
+          <div className="particle-legends">
+            <span>
+              <span className="particle-dot ion-dot" />
+              {ionSpecies}⁺ 离子
+            </span>
+            <span>
+              <span className="particle-dot electron-dot" />
+              电子
+            </span>
+          </div>
+        </div>
+      )}
+      <p className="animation-caption">上方：bulk plasma；中部：预鞘层；下方：鞘层与探针导体。</p>
     </div>
   );
 }

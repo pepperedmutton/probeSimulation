@@ -303,3 +303,232 @@ main {
     flex-direction: column;
   }
 }
+
+.pic-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.pic-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+}
+
+.stream-status {
+  font-size: 0.92rem;
+  color: #a8b5d8;
+}
+
+.stream-status.stream-ok {
+  color: #4ade80;
+}
+
+.stream-status.stream-idle {
+  color: #f7c873;
+}
+
+.pic-status {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  background: rgba(8, 10, 16, 0.85);
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 1rem;
+  color: #dbe7ff;
+  font-size: 0.95rem;
+  line-height: 1.4;
+}
+
+.pic-field-stats {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  background: rgba(8, 10, 16, 0.85);
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 1rem;
+}
+
+.pic-results {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.pic-stats {
+  flex: 1;
+  background: rgba(8, 10, 16, 0.85);
+  border-radius: 12px;
+  padding: 1rem;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #d8e6ff;
+  line-height: 1.6;
+}
+
+.pic-profile {
+  flex: 2;
+  background: rgba(8, 10, 16, 0.85);
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 1rem;
+  overflow-x: auto;
+}
+
+.pic-profile table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.pic-profile th,
+.pic-profile td {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+}
+
+.pic-chart {
+  margin-top: 1rem;
+  padding: 0.75rem;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(8, 10, 16, 0.75);
+}
+
+.animation-panel {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 20px;
+}
+
+.particle-animation {
+  background: radial-gradient(circle at top, rgba(70, 102, 179, 0.5), rgba(10, 12, 18, 0.9));
+  border-radius: 18px;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.domain-info {
+  align-self: flex-start;
+  font-size: 0.9rem;
+  color: #d8e6ff;
+  margin-bottom: 0.5rem;
+}
+
+.animation-canvas-wrapper {
+  position: relative;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.particle-animation canvas {
+  width: 100%;
+  height: auto;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  background: linear-gradient(to bottom, rgba(255, 255, 255, 0.1), rgba(4, 5, 9, 0.9));
+}
+
+.animation-placeholder {
+  width: 100%;
+  min-height: 220px;
+  border-radius: 12px;
+  border: 1px dashed rgba(255, 255, 255, 0.2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #b8c7eb;
+  background: rgba(10, 12, 18, 0.6);
+}
+
+.probe-surface-label {
+  font-size: 0.9rem;
+  color: #ffe8b5;
+  text-shadow: 0 0 6px rgba(0, 0, 0, 0.7);
+}
+
+.probe-surface-strip {
+  margin-top: 0.35rem;
+  width: 100%;
+  background: linear-gradient(to right, #050505, #151515);
+  border-radius: 8px;
+  padding: 0.4rem 0;
+  text-align: center;
+  font-size: 0.9rem;
+  color: #fdf1c7;
+}
+
+.animation-caption {
+  margin-top: 0.6rem;
+  font-size: 0.9rem;
+  color: #afc0e5;
+}
+
+.potential-legend {
+  margin-top: 0.75rem;
+  width: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.colorbar {
+  flex: 1;
+  min-width: 200px;
+}
+
+.colorbar span {
+  display: block;
+  font-size: 0.85rem;
+  color: #c9d4f1;
+  margin-bottom: 0.3rem;
+}
+
+.colorbar-gradient {
+  height: 12px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #3b82f6 0%, #f6f6f6 50%, #ef4444 100%);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.colorbar-values {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75rem;
+  color: #9db1de;
+  margin-top: 0.2rem;
+}
+
+.particle-legends {
+  display: flex;
+  gap: 1.2rem;
+  font-size: 0.9rem;
+  color: #ecf1ff;
+}
+
+.particle-dot {
+  display: inline-flex;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 0.35rem;
+}
+
+.particle-dot.ion-dot {
+  background: #ff9500;
+  box-shadow: 0 0 6px rgba(255, 149, 0, 0.6);
+}
+
+.particle-dot.electron-dot {
+  background: #40b6ff;
+  box-shadow: 0 0 6px rgba(64, 182, 255, 0.6);
+}
