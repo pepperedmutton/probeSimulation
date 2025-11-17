@@ -1,0 +1,46 @@
+plasma:
+  gas: Xe
+  neutral_pressure_pa: 0.5
+  gas_temperature_k: 300.0
+  ionization_fraction: 0.05
+  electron_temperature_ev: 3.0
+  ion_temperature_ev: 0.05
+  plasma_potential_v: 15.0
+
+domain:
+  lx_m: 0.0096
+  ly_m: 0.0016
+  nx: 384
+  ny: 120
+  particles_per_species: 80000
+  snapshot_interval: 20
+  downsample: 2
+  poisson_iterations: 80
+  relaxation_steps: 60
+  domain_depth: 0.001
+  rng_seed: 17
+  charge_smoothing_steps: 8
+  charge_relaxation: 0.05
+  planar_symmetry: true
+  planar_effective_area_m2: 1.57e-5
+  window_fraction_x: [0.375, 0.625]
+
+probe:
+  shape: circle
+  center_x_m: 0.0012
+  center_y_m: 0.00035
+  radius_m: 0.00008
+
+bias_scan:
+  bias_values: [15.0]
+  ramp_steps: 100
+  settle_steps: 120
+  measure_steps: 400
+
+diagnostics:
+  snapshot_dir: outputs/xe_benchmark
+  summary_path: outputs/xe_benchmark/run_summary.txt
+  snapshot_steps: [0, 100, 200, 400, 600, 800]
+  downsample: 2
+  metadata_overrides:
+    description: Xe benchmark (0.5 Pa, 5% ionized, 15 V bulk)

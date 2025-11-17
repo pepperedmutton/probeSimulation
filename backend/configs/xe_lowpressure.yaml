@@ -1,0 +1,44 @@
+plasma:
+  gas: Xe
+  neutral_pressure_pa: 0.05
+  gas_temperature_k: 300.0
+  ionization_fraction: 0.02
+  electron_temperature_ev: 2.0
+  ion_temperature_ev: 0.03
+  plasma_potential_v: 12.0
+
+domain:
+  lx_m: 0.0048
+  ly_m: 0.0008
+  nx: 192
+  ny: 64
+  particles_per_species: 32000
+  snapshot_interval: 20
+  downsample: 2
+  poisson_iterations: 60
+  relaxation_steps: 40
+  domain_depth: 0.001
+  rng_seed: 23
+  charge_smoothing_steps: 4
+  charge_relaxation: 0.1
+  planar_symmetry: true
+  planar_effective_area_m2: 1.57e-5
+  window_fraction_x: [0.375, 0.625]
+
+probe:
+  shape: circle
+  center_x_m: 0.0006
+  center_y_m: 0.00018
+  radius_m: 0.00006
+
+bias_scan:
+  bias_values: [12.0, 10.0, 8.0]
+  ramp_steps: 40
+  settle_steps: 40
+  measure_steps: 120
+
+diagnostics:
+  snapshot_dir: outputs/xe_lowpressure
+  summary_path: outputs/xe_lowpressure/run_summary.txt
+  snapshot_steps: [40, 120, 240]
+  downsample: 2

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
+
+from .diagnostics import DiagnosticsConfig, DiagnosticsWriter
 
 ELEMENTARY_CHARGE = 1.602176634e-19
 PERMITTIVITY_0 = 8.8541878128e-12
@@ -84,7 +86,14 @@ class SimulationConfig:
     relaxation_steps: int = 0
     max_inject_per_step: int = 64
     domain_depth: float = DEFAULT_DEPTH
+    planar_effective_area_m2: Optional[float] = None
     rng_seed: Optional[int] = None
+    diagnostics: Optional[DiagnosticsConfig] = None
+    charge_smoothing_steps: int = 0
+    charge_relaxation: float = 1.0
+    planar_symmetry: bool = False
+    window_x_fraction: Tuple[float, float] = (0.0, 1.0)
+    window_y_fraction: Tuple[float, float] = (0.0, 1.0)
 
 
 @dataclass
@@ -154,12 +163,41 @@ class ProbePICSimulation:
         self.node_charge = np.zeros_like(self.phi)
         self.ex = np.zeros_like(self.phi)
         self.ey = np.zeros_like(self.phi)
+        self.prev_rho = np.zeros_like(self.phi)
+        self._planar_phi: Optional[np.ndarray] = None
+        self.effective_domain_depth = config.domain_depth
+        if config.planar_symmetry and config.planar_effective_area_m2:
+            area = max(config.planar_effective_area_m2, 1e-18)
+            self.effective_domain_depth = area / max(config.lx, 1e-12)
         self.current_probe_voltage = config.boundary_potential
         self.currents = {"total": 0.0, "electrons": 0.0, "ions": 0.0}
         self.time = 0.0
         self.step_index = 0
         self.snapshot_interval = max(1, config.snapshot_interval)
         self.downsample = max(1, config.downsample)
+        self.diagnostics_writer: Optional[DiagnosticsWriter] = None
+        if config.diagnostics:
+            metadata = dict(config.diagnostics.metadata)
+            metadata.setdefault(
+                "grid",
+                {
+                    "nx": config.nx,
+                    "ny": config.ny,
+                    "lx": config.lx,
+                    "ly": config.ly,
+                },
+            )
+            metadata.setdefault(
+                "plasma",
+                {
+                    "density_m3": config.density_m3,
+                    "electron_temperature_ev": config.electron_temperature_ev,
+                    "ion_temperature_ev": config.ion_temperature_ev,
+                },
+            )
+            config.diagnostics.metadata = metadata
+            self.diagnostics_writer = DiagnosticsWriter(config.diagnostics)
+        self._init_display_window()
 
         self.electrons = self._create_species(
             name="electrons",
@@ -188,7 +226,7 @@ class ProbePICSimulation:
 
     def _create_species(self, name: str, charge: float, mass: float, temperature_ev: float) -> SpeciesState:
         desired = max(self.config.particles_per_species, 10)
-        volume = self.config.lx * self.config.ly * self.config.domain_depth
+        volume = self.config.lx * self.config.ly * self.effective_domain_depth
         macro_weight = max(self.config.density_m3 * volume / desired, 1.0)
         positions = self._sample_positions(desired)
         velocities = _maxwellian_velocity(temperature_ev, mass, desired, self.rng)
@@ -253,10 +291,24 @@ class ProbePICSimulation:
         self.node_charge.fill(0.0)
         self._deposit_species(self.ions)
         self._deposit_species(self.electrons)
-        volume = self.cell_area * self.config.domain_depth
+        volume = self.cell_area * self.effective_domain_depth
         self.rho[:, :] = self.node_charge / max(volume, 1e-12)
+        mean_charge = np.mean(self.rho)
+        if not np.isclose(mean_charge, 0.0):
+            self.rho -= mean_charge
+        for _ in range(max(0, self.config.charge_smoothing_steps)):
+            self.rho = self._smooth_charge(self.rho)
+        alpha = float(np.clip(self.config.charge_relaxation, 0.0, 1.0))
+        if alpha < 1.0:
+            self.rho = alpha * self.rho + (1.0 - alpha) * self.prev_rho
+        self.prev_rho = self.rho.copy()
+        if self.config.planar_symmetry:
+            self._enforce_planar_profile(self.rho)
 
     def _solve_poisson(self) -> None:
+        if self.config.planar_symmetry:
+            self._solve_planar_poisson()
+            return
         dx2 = self.dx**2
         dy2 = self.dy**2
         denom = 2 * (dx2 + dy2)
@@ -281,6 +333,9 @@ class ProbePICSimulation:
     def _update_fields(self) -> None:
         self.ex = -np.gradient(self.phi, self.dx, axis=0)
         self.ey = -np.gradient(self.phi, self.dy, axis=1)
+        if self.config.planar_symmetry:
+            self.ex.fill(0.0)
+            self._enforce_planar_profile(self.ey)
 
     def _interpolate_field(self, positions: np.ndarray) -> np.ndarray:
         if positions.size == 0:
@@ -310,6 +365,103 @@ class ProbePICSimulation:
         ey = bilinear(self.ey)
         return np.stack((ex, ey), axis=1)
 
+    def _smooth_charge(self, rho: np.ndarray) -> np.ndarray:
+        kernel = (
+            0.25 * rho
+            + 0.125 * (np.roll(rho, 1, axis=0) + np.roll(rho, -1, axis=0))
+            + 0.125 * (np.roll(rho, 1, axis=1) + np.roll(rho, -1, axis=1))
+        )
+        kernel[0, :] = rho[0, :]
+        kernel[-1, :] = rho[-1, :]
+        kernel[:, 0] = rho[:, 0]
+        kernel[:, -1] = rho[:, -1]
+        return kernel
+
+    def _enforce_planar_profile(self, array: np.ndarray) -> None:
+        profile = np.mean(array, axis=0, keepdims=True)
+        array[:, :] = profile
+
+    def _compute_window_slice(self, length: float, coords: np.ndarray, fraction: Tuple[float, float]) -> slice:
+        f0 = max(0.0, min(1.0, float(fraction[0])))
+        f1 = max(f0 + 1e-6, min(1.0, float(fraction[1])))
+        x_min = length * f0
+        x_max = length * f1
+        start = int(np.searchsorted(coords, x_min, side="left"))
+        stop = int(np.searchsorted(coords, x_max, side="right"))
+        n = coords.size
+        start = max(0, min(n - 2, start))
+        stop = max(start + 2, min(n, stop))
+        return slice(start, stop)
+
+    def _init_display_window(self) -> None:
+        self.window_slice_x = self._compute_window_slice(
+            self.config.lx, self.x, self.config.window_x_fraction
+        )
+        self.window_slice_y = self._compute_window_slice(
+            self.config.ly, self.y, self.config.window_y_fraction
+        )
+        self.window_x_coords = self.x[self.window_slice_x]
+        self.window_y_coords = self.y[self.window_slice_y]
+        self.window_bounds_x = (
+            float(self.window_x_coords[0]),
+            float(self.window_x_coords[-1]),
+        )
+        self.window_bounds_y = (
+            float(self.window_y_coords[0]),
+            float(self.window_y_coords[-1]),
+        )
+
+    def get_windowed_field(self, array: np.ndarray) -> np.ndarray:
+        return array[self.window_slice_x, self.window_slice_y]
+
+    def get_windowed_coords(self) -> tuple[np.ndarray, np.ndarray]:
+        return self.window_x_coords, self.window_y_coords
+
+    def _solve_planar_poisson(self) -> None:
+        ny = self.config.ny
+        dy2 = self.dy**2
+        rho_avg = np.mean(self.rho, axis=0)
+        probe_rows = np.any(self.probe_mask, axis=0)
+        dirichlet = np.zeros(ny, dtype=bool)
+        dirichlet_values = np.full(ny, self.config.boundary_potential)
+        dirichlet[0] = True
+        dirichlet_values[0] = self.current_probe_voltage
+        dirichlet[-1] = True
+        dirichlet_values[-1] = self.config.boundary_potential
+        probe_indices = np.where(probe_rows)[0]
+        if probe_indices.size:
+            max_probe = probe_indices.max()
+            dirichlet[: max_probe + 1] = True
+            dirichlet_values[: max_probe + 1] = self.current_probe_voltage
+        free_indices = [j for j in range(ny) if not dirichlet[j]]
+        phi_y = dirichlet_values.copy()
+        if free_indices:
+            n_free = len(free_indices)
+            A = np.zeros((n_free, n_free))
+            b = np.zeros(n_free)
+            index_map = {value: idx for idx, value in enumerate(free_indices)}
+            for idx, j in enumerate(free_indices):
+                A[idx, idx] = -2.0 / dy2
+                rhs = -rho_avg[j] / PERMITTIVITY_0
+                if j - 1 >= 0:
+                    if dirichlet[j - 1]:
+                        rhs -= dirichlet_values[j - 1] / dy2
+                    else:
+                        A[idx, index_map[j - 1]] = 1.0 / dy2
+                if j + 1 < ny:
+                    if dirichlet[j + 1]:
+                        rhs -= dirichlet_values[j + 1] / dy2
+                    else:
+                        A[idx, index_map[j + 1]] = 1.0 / dy2
+                b[idx] = rhs
+            solution = np.linalg.solve(A, b)
+            for idx, j in enumerate(free_indices):
+                phi_y[j] = solution[idx]
+        self._planar_phi = phi_y
+        self.phi[:, :] = phi_y[np.newaxis, :]
+        if np.any(self.probe_mask):
+            self.phi[self.probe_mask] = self.current_probe_voltage
+
     def _handle_probe_collisions(self, species: SpeciesState) -> None:
         if species.positions.size == 0:
             return
@@ -337,20 +489,21 @@ class ProbePICSimulation:
     def _handle_domain_boundaries(self, species: SpeciesState) -> None:
         if species.positions.size == 0:
             return
-        # Periodic wrap along x: particles re-enter opposite boundary with same velocity.
         species.positions[:, 0] = np.mod(species.positions[:, 0], self.config.lx)
         y = species.positions[:, 1]
         hits_bottom = y < 0.0
-        hits_top = y > self.config.ly
 
         if np.any(hits_bottom):
             removed = np.count_nonzero(hits_bottom)
-            self._record_probe_hits(species, removed)
+            if self.config.planar_symmetry:
+                self._record_probe_hits(species, removed)
             keep = ~hits_bottom
             species.positions = species.positions[keep]
             species.velocities = species.velocities[keep]
-            y = species.positions[:, 1]
-
+        if species.positions.size == 0:
+            return
+        y = species.positions[:, 1]
+        hits_top = y > self.config.ly
         if np.any(hits_top):
             keep = ~hits_top
             species.positions = species.positions[keep]
@@ -368,12 +521,16 @@ class ProbePICSimulation:
         species.velocities = np.vstack((species.velocities, velocities))
 
     def _spawn_boundary_particles(self, species: SpeciesState, count: int) -> tuple[np.ndarray, np.ndarray]:
-        eps = min(self.dx, self.dy) * 0.5
-        x = self.rng.random(count) * self.config.lx
-        y = np.full(count, self.config.ly - eps)
-        positions = np.stack((x, y), axis=1)
+        positions = self._sample_positions(count)
         velocities = _maxwellian_velocity(species.temperature_ev, species.mass, count, self.rng)
-        velocities[:, 1] = -np.abs(velocities[:, 1])
+        if species.charge > 0:
+            drift = -np.sqrt(
+                max(species.temperature_ev, 1e-4) * ELEMENTARY_CHARGE / max(species.mass, 1e-30)
+            )
+            velocities[:, 1] = -np.abs(velocities[:, 1]) + drift
+        else:
+            signs = self.rng.choice([-1.0, 1.0], size=count)
+            velocities[:, 1] = signs * np.abs(velocities[:, 1])
         return positions, velocities
 
     def _push_species(self, species: SpeciesState) -> None:
@@ -400,6 +557,11 @@ class ProbePICSimulation:
         if self.step_index % self.snapshot_interval != 0:
             return
         down = self.downsample
+        window_phi = self.get_windowed_field(self.phi)
+        window_rho = self.get_windowed_field(self.rho)
+        e_mag = np.hypot(self.ex, self.ey)
+        window_e_mag = self.get_windowed_field(e_mag)
+        x_coords, y_coords = self.get_windowed_coords()
         payload = {
             "type": "snapshot",
             "step": self.step_index,
@@ -410,13 +572,13 @@ class ProbePICSimulation:
             "probe_voltage": self.current_probe_voltage,
             "currents": self.get_probe_currents(),
             "grid": {
-                "x": self.x[::down].tolist(),
-                "y": self.y[::down].tolist(),
+                "x": x_coords[::down].tolist(),
+                "y": y_coords[::down].tolist(),
             },
             "fields": {
-                "phi": self.phi[::down, ::down].tolist(),
-                "rho": self.rho[::down, ::down].tolist(),
-                "e_magnitude": np.hypot(self.ex, self.ey)[::down, ::down].tolist(),
+                "phi": window_phi[::down, ::down].tolist(),
+                "rho": window_rho[::down, ::down].tolist(),
+                "e_magnitude": window_e_mag[::down, ::down].tolist(),
             },
             "particles": {
                 "ions": self._sample_particles_for_viz(self.ions, 256),
@@ -425,14 +587,49 @@ class ProbePICSimulation:
         }
         callback(payload)
 
+    def _maybe_record_snapshot(
+        self,
+        *,
+        bias_index: int,
+        bias_value: float,
+        phase: str,
+    ) -> None:
+        if not self.diagnostics_writer:
+            return
+        self.diagnostics_writer.maybe_capture(
+            sim=self,
+            step=self.step_index,
+            bias_index=bias_index,
+            bias_value=bias_value,
+            phase=phase,
+        )
+
     def _sample_particles_for_viz(self, species: SpeciesState, limit: int) -> List[List[float]]:
-        count = species.positions.shape[0]
+        positions = species.positions
+        if positions.size == 0:
+            return []
+        if (
+            self.window_slice_x.start > 0
+            or self.window_slice_x.stop < self.config.nx
+            or self.window_slice_y.start > 0
+            or self.window_slice_y.stop < self.config.ny
+        ):
+            x_min, x_max = self.window_bounds_x
+            y_min, y_max = self.window_bounds_y
+            mask = (
+                (positions[:, 0] >= x_min)
+                & (positions[:, 0] <= x_max)
+                & (positions[:, 1] >= y_min)
+                & (positions[:, 1] <= y_max)
+            )
+            positions = positions[mask]
+        count = positions.shape[0]
         if count == 0:
             return []
         if count <= limit:
-            return species.positions.tolist()
+            return positions.tolist()
         idx = self.rng.choice(count, size=limit, replace=False)
-        return species.positions[idx].tolist()
+        return positions[idx].tolist()
 
     def advance_step(
         self,
@@ -451,6 +648,7 @@ class ProbePICSimulation:
         self.step_index += 1
         self.time += self.dt
         self._maybe_stream(callback, bias_index=bias_index, bias_value=bias_value, phase=phase)
+        self._maybe_record_snapshot(bias_index=bias_index, bias_value=bias_value, phase=phase)
 
     def run_bias_scan(
         self,
@@ -478,6 +676,14 @@ class ProbePICSimulation:
                         "data": iv_point,
                     }
                 )
+        if self.diagnostics_writer:
+            self.diagnostics_writer.finalize(
+                {
+                    "iv_curve": results,
+                    "completed_steps": self.step_index,
+                    "simulation_time_s": self.time,
+                }
+            )
         return results
 
     def _ramp_to_bias(

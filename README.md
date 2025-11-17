@@ -118,6 +118,38 @@ npm install
 npm run dev
 ```
 
+### Text-Based Runs & Diagnostics
+
+For scripted sweeps or offline debugging you can run the PIC solver directly from YAML/JSON. The CLI reuses the same `ProbePICSimulation` core as the Web UI while enabling deterministic input files and on-disk diagnostics.
+
+```
+cd backend
+python -m app.run_config configs/xe_benchmark.yaml
+```
+
+Config sections:
+
+- `plasma`: gas (`Ar`/`Xe`), neutral pressure/temperature, ionization fraction, electron/ion temperatures, and bulk potential. Derived values (neutral density, plasma density, Debye length, plasma frequency) are logged automatically.
+- `domain`: sizes in meters, grid resolution, macroparticles, Poisson iterations, relaxation steps, RNG seed, etc.
+- `probe`: circle or rectangle geometry specified in meters.
+- `bias_scan`: either explicit `bias_values` or `min/max/step`, along with ramp/settle/measure steps.
+- `diagnostics`: optional snapshot support. Provide a `snapshot_dir`, list of `snapshot_steps` (and/or `snapshot_interval`), `summary_path`, downsample factor, and optional particle sampling limits.
+- `window_fraction_x` / `window_fraction_y`: (optional) two-element lists `[start, end]` defining which portion of the large domain is streamed/saved. Use a big domain (many λ_D) to suppress edge effects, then pick a central window (e.g., `[0.375, 0.625]`) so the UI still shows the familiar probe region.
+- `planar_symmetry`: set to `true` to collapse the solver into a quasi-1D sheath above a planar probe. When this mode is enabled, you can supply `planar_effective_area_m2` so the strip modeled in x represents the physical collection area of your probe (defaults to `lx × domain_depth` if omitted).
+
+Snapshots are written as `.npz` files containing downsampled `φ`, `ρ`, `E`, probe currents, and particle counts; they can be inspected with NumPy/Matplotlib. The summary text file mirrors the metadata, captured snapshots, and the final I–V values returned by the run.
+
+### Xe Benchmark Workflow
+
+`backend/configs/xe_benchmark.yaml` implements the Xe 0.5 Pa / 5 % / 15 V benchmark referenced in the task:
+
+- Derived density `n₀ ≈ 6×10¹⁸ m⁻³`, Debye length `λ_D ≈ 16 µm`, and `T_e = 3 eV`, `T_i = 0.05 eV`.
+- Grid `96×120` over a 2.4 mm × 1.6 mm domain resolves several Debye lengths surrounding the probe (radius 80 µm, positioned near the lower boundary).
+- `particles_per_species = 6000`, `poisson_iterations = 80`, `relaxation_steps = 60`, and a single bias value (15 V) stabilize the sheath before averaging probe currents.
+- Diagnostics capture snapshots at steps `[0,100,200,400,600,800]` into `backend/outputs/xe_benchmark/` and write a run summary with derived parameters plus averaged probe currents.
+
+You can duplicate/adjust this config, rerun `python -m app.run_config`, and cross-check the snapshots with the Web UI. The API endpoints remain backward compatible—the CLI simply exposes the same solver with extra diagnostics for automated testing. Need a fast smoke test? `backend/configs/xe_quicktest.yaml` reduces the grid and step counts so you can verify code changes in ~30 s before launching the heavier benchmark job. In planar mode remember that a plate biased near the plasma potential collects the electron saturation current (≈0.8 A for the quick test, ≈3 A for the larger benchmark area); scan lower biases to approach the floating condition where ion and electron fluxes balance. Both configs now run on domains several Debye lengths wider/taller than the displayed window—controlled via `window_fraction_x/y`—so the central sheath looks uniform even though boundaries remain far away.
+
 ---
 
 ## API Summary
@@ -164,3 +196,4 @@ When modifying the PIC solver, remember to keep the WebSocket payload schema sta
 The project is distributed for research/educational purposes. Please verify the assumptions of each model before using the outputs to interpret experimental data, especially outside the collisionless, low-pressure regime.
 
 Happy probing! :satellite:
+好吧，我承认在数学上实现这个无限长的导体的计算是不可能的。那你就要让仿真的计算域远大于德拜长度，然后只取中心的一小块，即我们现有仿真域的大小，来呈现结果，这样可以最大程度的抑制导体的有限尺寸效应，同时又不让计算量太高。
