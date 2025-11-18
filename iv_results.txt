@@ -1,0 +1,53 @@
+Scenario: Ar ICP baseline
+  Plasma: ne=5.000e+15 m^-3, Te=3.00 eV, Vs=0.00 V, species=Ar
+  Probe: area=1.000e-06 m^2, radius=1.000e-03 m, length=5.000e-03 m
+  Model: ABR, sweep=(-60.0 V -> 20.0 V, 400 pts)
+  Floating potential (numeric): -2.45 V
+  ln(Ie) fitted Te: n/a
+  Bohm I_sat estimate: 1.2938245971737266e-06
+  Status: OK
+
+Scenario: Hydrogen OML
+  Plasma: ne=1.000e+14 m^-3, Te=5.00 eV, Vs=5.00 V, species=H
+  Probe: area=5.000e-07 m^2, radius=5.000e-04 m, length=4.000e-03 m
+  Model: OML, sweep=(-40.0 V -> 15.0 V, 350 pts)
+  Floating potential (numeric): 4.17 V
+  ln(Ie) fitted Te: n/a
+  Bohm I_sat estimate: 1.051896366644219e-07
+  Status: OK
+
+Scenario: Child-Langmuir dense
+  Plasma: ne=5.000e+17 m^-3, Te=2.50 eV, Vs=2.00 V, species=Ar
+  Probe: area=1.500e-06 m^2, radius=8.000e-04 m, length=5.000e-03 m
+  Model: ChildLangmuir, sweep=(-80.0 V -> 10.0 V, 500 pts)
+  Floating potential (numeric): -11.47 V
+  ln(Ie) fitted Te: 2.50 eV
+  Bohm I_sat estimate: 0.00017716422933177124
+  Status: OK
+
+Scenario: BRL intermediate
+  Plasma: ne=2.000e+16 m^-3, Te=4.00 eV, Vs=1.00 V, species=Ar
+  Probe: area=8.000e-07 m^2, radius=7.000e-04 m, length=3.000e-03 m
+  Model: BRL, sweep=(-50.0 V -> 15.0 V, 360 pts)
+  Floating potential (numeric): -3.51 V
+  ln(Ie) fitted Te: 4.00 eV
+  Bohm I_sat estimate: 4.780735868559425e-06
+  Status: OK
+
+Scenario: High-density ABR
+  Plasma: ne=1.000e+18 m^-3, Te=2.00 eV, Vs=3.00 V, species=Ar
+  Probe: area=2.000e-06 m^2, radius=1.200e-03 m, length=6.000e-03 m
+  Model: ABR, sweep=(-90.0 V -> 15.0 V, 520 pts)
+  Floating potential (numeric): 1.23 V
+  ln(Ie) fitted Te: n/a
+  Bohm I_sat estimate: 0.0004225613439650161
+  Status: OK
+
+Scenario: Low-density Child-Langmuir validation
+  Plasma: ne=5.000e+13 m^-3, Te=3.50 eV, Vs=0.00 V, species=H
+  Probe: area=7.000e-07 m^2, radius=6.000e-04 m, length=4.000e-03 m
+  Model: ChildLangmuir, sweep=(-55.0 V -> 20.0 V, 300 pts)
+  Floating potential (numeric): -12.11 V
+  ln(Ie) fitted Te: 3.50 eV
+  Bohm I_sat estimate: 6.160557494193552e-08
+  Status: OK
