@@ -94,6 +94,8 @@ class SimulationConfig:
     planar_symmetry: bool = False
     window_x_fraction: Tuple[float, float] = (0.0, 1.0)
     window_y_fraction: Tuple[float, float] = (0.0, 1.0)
+    periodic_x: bool = False
+    enforce_lateral_uniformity: bool = False
 
 
 @dataclass
@@ -137,10 +139,13 @@ def apply_potential_boundary_conditions(
     boundary_value: float,
     probe_value: float,
     probe_mask: np.ndarray,
+    *,
+    periodic_x: bool = False,
 ) -> None:
     """Impose Dirichlet boundaries on outer edges and probe nodes."""
-    phi[0, :] = boundary_value
-    phi[-1, :] = boundary_value
+    if not periodic_x:
+        phi[0, :] = boundary_value
+        phi[-1, :] = boundary_value
     phi[:, 0] = boundary_value
     phi[:, -1] = boundary_value
     phi[probe_mask] = probe_value
@@ -222,7 +227,13 @@ class ProbePICSimulation:
         else:
             self.dt = config.dt
 
-        apply_potential_boundary_conditions(self.phi, config.boundary_potential, self.current_probe_voltage, self.probe_mask)
+        apply_potential_boundary_conditions(
+            self.phi,
+            config.boundary_potential,
+            self.current_probe_voltage,
+            self.probe_mask,
+            periodic_x=self.config.periodic_x,
+        )
 
     def _create_species(self, name: str, charge: float, mass: float, temperature_ev: float) -> SpeciesState:
         desired = max(self.config.particles_per_species, 10)
@@ -304,6 +315,8 @@ class ProbePICSimulation:
         self.prev_rho = self.rho.copy()
         if self.config.planar_symmetry:
             self._enforce_planar_profile(self.rho)
+        elif self.config.enforce_lateral_uniformity:
+            self._enforce_planar_profile(self.rho)
 
     def _solve_poisson(self) -> None:
         if self.config.planar_symmetry:
@@ -312,14 +325,21 @@ class ProbePICSimulation:
         dx2 = self.dx**2
         dy2 = self.dy**2
         denom = 2 * (dx2 + dy2)
+        periodic = self.config.periodic_x
+        nx = self.config.nx
+        ny = self.config.ny
         for _ in range(self.config.poisson_iterations):
-            for i in range(1, self.config.nx - 1):
-                for j in range(1, self.config.ny - 1):
+            for i in range(nx):
+                if not periodic and (i == 0 or i == nx - 1):
+                    continue
+                ip = (i + 1) % nx if periodic else i + 1
+                im = (i - 1) % nx if periodic else i - 1
+                for j in range(1, ny - 1):
                     if self.probe_mask[i, j]:
                         continue
                     rhs = -self.rho[i, j] * dx2 * dy2 / PERMITTIVITY_0
                     self.phi[i, j] = (
-                        (self.phi[i + 1, j] + self.phi[i - 1, j]) * dy2
+                        (self.phi[ip, j] + self.phi[im, j]) * dy2
                         + (self.phi[i, j + 1] + self.phi[i, j - 1]) * dx2
                         + rhs
                     ) / denom
@@ -328,12 +348,18 @@ class ProbePICSimulation:
                 self.config.boundary_potential,
                 self.current_probe_voltage,
                 self.probe_mask,
+                periodic_x=self.config.periodic_x,
             )
+        if self.config.enforce_lateral_uniformity:
+            self._enforce_planar_profile(self.phi)
 
     def _update_fields(self) -> None:
         self.ex = -np.gradient(self.phi, self.dx, axis=0)
         self.ey = -np.gradient(self.phi, self.dy, axis=1)
         if self.config.planar_symmetry:
+            self.ex.fill(0.0)
+            self._enforce_planar_profile(self.ey)
+        elif self.config.enforce_lateral_uniformity:
             self.ex.fill(0.0)
             self._enforce_planar_profile(self.ey)
 
@@ -461,6 +487,13 @@ class ProbePICSimulation:
         self.phi[:, :] = phi_y[np.newaxis, :]
         if np.any(self.probe_mask):
             self.phi[self.probe_mask] = self.current_probe_voltage
+        apply_potential_boundary_conditions(
+            self.phi,
+            self.config.boundary_potential,
+            self.current_probe_voltage,
+            self.probe_mask,
+            periodic_x=self.config.periodic_x,
+        )
 
     def _handle_probe_collisions(self, species: SpeciesState) -> None:
         if species.positions.size == 0:
@@ -571,6 +604,7 @@ class ProbePICSimulation:
             "phase": phase,
             "probe_voltage": self.current_probe_voltage,
             "currents": self.get_probe_currents(),
+            "planar_mode": self.config.planar_symmetry or self.config.enforce_lateral_uniformity,
             "grid": {
                 "x": x_coords[::down].tolist(),
                 "y": y_coords[::down].tolist(),

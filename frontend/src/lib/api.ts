@@ -125,6 +125,7 @@ export type PicSnapshotMessage = {
   bias_value: number;
   phase: string;
   probe_voltage: number;
+  planar_mode?: boolean;
   currents: {
     total: number;
     electrons: number;

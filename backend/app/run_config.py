@@ -189,6 +189,8 @@ def build_simulation_config(data: Dict[str, Any]) -> tuple[SimulationConfig, Bia
         planar_effective_area_m2=domain_cfg.get("planar_effective_area_m2"),
         window_x_fraction=window_x_fraction,
         window_y_fraction=window_y_fraction,
+        periodic_x=bool(domain_cfg.get("periodic_x", False)),
+        enforce_lateral_uniformity=bool(domain_cfg.get("enforce_lateral_uniformity", False)),
     )
     bias_scan = build_bias_scan(data["bias_scan"])
     return sim_config, bias_scan

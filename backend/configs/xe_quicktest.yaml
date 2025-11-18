@@ -17,19 +17,21 @@ domain:
   downsample: 2
   poisson_iterations: 60
   relaxation_steps: 20
-  domain_depth: 0.001
+  domain_depth: 0.002453125
   rng_seed: 11
   charge_smoothing_steps: 6
   charge_relaxation: 0.05
-  planar_symmetry: true
-  planar_effective_area_m2: 1.57e-5
   window_fraction_x: [0.375, 0.625]
+  window_fraction_y: [0.375, 0.625]
+  periodic_x: true
+  enforce_lateral_uniformity: true
 
 probe:
-  shape: circle
-  center_x_m: 0.0008
-  center_y_m: 0.00025
-  radius_m: 0.00008
+  shape: rectangle
+  center_x_m: 0.0032
+  center_y_m: 0.00005
+  width_m: 0.0064
+  height_m: 0.0001
 
 bias_scan:
   bias_values: [15.0]

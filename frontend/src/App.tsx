@@ -907,6 +907,7 @@ function ParticleAnimation({
     const range = potentialStats ?? { min: 0, max: 0, maxAbs: 1 };
 
     const phiGrid = snapshot.fields.phi;
+    const planarMode = Boolean(snapshot.planar_mode);
     const phiNx = phiGrid.length;
     const phiNy = phiNx > 0 ? phiGrid[0].length : 0;
 
@@ -934,13 +935,26 @@ function ParticleAnimation({
     if (phiNx && phiNy) {
       const cellWidth = width / phiNx;
       const cellHeight = height / phiNy;
-      for (let ix = 0; ix < phiNx; ix += 1) {
+      if (planarMode) {
         for (let iy = 0; iy < phiNy; iy += 1) {
-          const value = phiGrid[ix][iy];
+          let sum = 0;
+          for (let ix = 0; ix < phiNx; ix += 1) {
+            sum += phiGrid[ix][iy];
+          }
+          const value = sum / phiNx;
           ctx.fillStyle = colorForPotential(value);
-          const xPx = ix * cellWidth;
           const yPx = height - (iy + 1) * cellHeight;
-          ctx.fillRect(xPx, yPx, cellWidth + 1, cellHeight + 1);
+          ctx.fillRect(0, yPx, width, cellHeight + 1);
+        }
+      } else {
+        for (let ix = 0; ix < phiNx; ix += 1) {
+          for (let iy = 0; iy < phiNy; iy += 1) {
+            const value = phiGrid[ix][iy];
+            ctx.fillStyle = colorForPotential(value);
+            const xPx = ix * cellWidth;
+            const yPx = height - (iy + 1) * cellHeight;
+            ctx.fillRect(xPx, yPx, cellWidth + 1, cellHeight + 1);
+          }
         }
       }
     }
