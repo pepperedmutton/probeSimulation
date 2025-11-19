@@ -171,6 +171,11 @@ button:not(:disabled):hover {
   border: 1px solid rgba(248, 113, 113, 0.3);
   color: #9f1239;
 }
+.alert.success {
+  background: rgba(134, 239, 172, 0.25);
+  border-color: rgba(16, 185, 129, 0.5);
+  color: #065f46;
+}
 
 .results {
   margin-top: 2rem;
