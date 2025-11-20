@@ -53,11 +53,11 @@ if (Test-Path ".venv\Scripts\Activate.ps1") {
 uvicorn app.main:app --reload --port $backendPort
 "@
 
-$frontendCmd = @"
-cd "$frontendDir"
-$env:VITE_API_BASE_URL = "http://localhost:$backendPort"
-npm run dev -- --host --port $frontendPort --open
-"@
+$frontendCmd = @'
+cd "{0}"
+$env:VITE_API_BASE_URL = "http://localhost:{1}"
+npm run dev -- --host --port {2} --open
+'@ -f $frontendDir, $backendPort, $frontendPort
 
 Start-Process -FilePath "powershell.exe" -ArgumentList "-NoExit", "-Command", $backendCmd
 Start-Process -FilePath "powershell.exe" -ArgumentList "-NoExit", "-Command", $frontendCmd

@@ -1,7 +1,11 @@
 import './App.css'
 import { LangmuirIVSimulator } from './pages/LangmuirIVSimulator'
+import { TestChart } from './pages/TestChart'
 
 function App() {
+  // Set to true to show test chart
+  const showTestChart = false
+  
   return (
     <div className="app-shell">
       <header className="site-header">
@@ -11,7 +15,7 @@ function App() {
         <div className="subtitle">Dynamic RF Langmuir I-V simulation</div>
       </header>
       <main className="app">
-        <LangmuirIVSimulator />
+        {showTestChart ? <TestChart /> : <LangmuirIVSimulator />}
       </main>
     </div>
   )

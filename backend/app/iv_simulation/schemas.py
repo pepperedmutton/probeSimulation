@@ -44,6 +44,11 @@ class RFParams(BaseModel):
 class TimeParams(BaseModel):
     total_time_s: float = Field(..., gt=0, description="Total simulation time [s]")
     dt_s: float = Field(..., gt=0, description="Time step [s]")
+    voltage_step_rf_cycles: float | None = Field(
+        None, 
+        ge=0, 
+        description="Number of RF cycles per voltage step (for staircase sweep). If None, uses continuous sweep."
+    )
 
     @field_validator("dt_s")
     @classmethod
